@@ -1,13 +1,13 @@
 # Django Blog REST API
 
-Training project for a Django blog and its Post REST API. The repository contains the work completed for Phases 1, 2, and 3. Phases 4 and 5 are currently study topics and are not implemented in this project.
+Training project for a Django blog and its Post REST API. The repository contains the work completed for Phases 1 through 4. Phase 5 is currently a study topic and is not implemented in this project.
 
 | Phase | Status in this repository |
 | --- | --- |
 | 1. Django Foundations | Partially implemented |
 | 2. Django REST Framework | Implemented for the Post API |
 | 3. API Architecture & Clean Structure | Partially implemented |
-| 4. Advanced Django ORM | Not implemented |
+| 4. Advanced Django ORM | Implemented |
 | 5. Production & Scaling | Not implemented |
 
 The API is built with Django 5.2 and Django REST Framework. Posts support create, read, update, and delete. Public clients can read posts. Creating, updating, and deleting a post requires a token.
@@ -100,7 +100,7 @@ The serializer fields are `id`, `title`, `content`, `is_published`, and read-onl
 
 `blog/tests.py` contains `PostApiTests` with 22 tests. They cover public reads, authenticated writes, invalid tokens, validation, partial and full updates, deletion, pagination, search, published filtering, and one request that combines filtering, search, and pagination.
 
-The latest run of `python manage.py test blog` reported **22 tests, OK**.
+The full blog suite, including the Phase 4 ORM tests, is described under Testing.
 
 ## Phase 3 – API Architecture & Clean Structure
 
@@ -115,22 +115,36 @@ The latest run of `python manage.py test blog` reported **22 tests, OK**.
 | Logging | The `blog` logger writes to the console at INFO with the format `{levelname} {name} {message}`. |
 | Environment variables | `python-dotenv` loads `.env`. `SECRET_KEY` is required. `DEBUG` is `True` only when its value is the text `True`. |
 
-Validation remains in the serializer. Published filtering remains in the view. Settings live in one module, `config/settings.py`. There are no direct tests for the service, queryset, manager, or signal.
+Validation remains in the serializer. Published filtering remains in the view. Settings live in one module, `config/settings.py`. Phase 4 tests cover the newer service helpers and queryset methods. `PublishedManager` still has no direct test.
 
 ## Phase 4 – Advanced Django ORM
 
-**Status: not implemented.**
+**Status: implemented.**
 
-These topics are being studied and are not present in the application code:
+The Post API response is unchanged. These features live in the models, `blog/expressions.py`, `blog/services.py`, and `Phase4OrmTests`. Migration `blog/migrations/0005_phase4_indexes_and_constraints.py` adds the index and constraints. Migrations `0001` through `0004` were not edited.
 
-- database indexes
-- database constraints
-- query optimization
-- transactions
-- `select_for_update`
-- bulk operations
+| Topic | Implementation |
+| --- | --- |
+| Indexes | `blog_post_published_id_idx` on `Post (is_published, id)`, matching the filtered list query. |
+| Constraints | A post title must be non-empty (`title > ''`). A post title must differ from its content. `Author.email` is unique. `Category.name` is unique. |
+| Custom function | `CharLength` calls the database `LENGTH` function. `PostQuerySet.with_title_length()` annotates `title_length`. |
+| Raw SQL | `published_post_count_raw()` runs `SELECT COUNT(*)` with the published flag passed as a bound parameter. |
+| Performance tuning | `published_post_count()` uses the ORM `count()` method, which is one query. |
+| Query optimization | `with_author()` uses `select_related("author")`. `with_categories()` uses `prefetch_related("categories")`. The list endpoint does not use them, because the serializer does not read those relations. |
+| Transactions | `create_author_with_profile()` inserts both rows inside `transaction.atomic()`. A failure rolls both back. |
+| `select_for_update` | `publish_post()` loads the row with `select_for_update()` inside `transaction.atomic()` and saves `is_published=True`. |
+| Bulk operations | `bulk_create_posts()` and `bulk_set_published()` use `bulk_create()` and `bulk_update()`. Neither calls `Model.save()`, and neither sends `pre_save` or `post_save`. `create_post()` is still a single `create()` and still sends the create signal. |
 
-Django's normal primary-key and foreign-key indexes are created by the existing migrations. There are no custom indexes, constraints, annotations, raw SQL queries, transactions, row locks, or bulk create/update operations in this project.
+### SQLite limitations
+
+The database engine is still SQLite. These limits are covered by the tests:
+
+- `connection.features.has_select_for_update` is false. Django accepts `select_for_update()` and then omits `FOR UPDATE` from the SQL. The tests check that SQL and the feature flag. They do not claim that a row lock was taken or that another connection was blocked.
+- A Django `CheckConstraint` cannot use the `title__length` transform. The non-empty rule is the direct comparison `title > ''`.
+- Unique email and category-name checks use SQLite's default case-sensitive comparison.
+- Search still uses a leading-wildcard `LIKE`, so the new index does not speed up `?search=`.
+
+`python manage.py makemigrations --check --dry-run` reported `No changes detected`. `python manage.py migrate` reported `No migrations to apply` after `0005` had already been applied. The existing development rows were kept: 6 posts, 1 author, 1 profile, and 1 category.
 
 ## Phase 5 – Production & Scaling
 
@@ -173,6 +187,7 @@ django-phase1-training/
     ├── urls.py
     ├── serializers.py
     ├── services.py
+    ├── expressions.py
     ├── signals.py
     ├── tests.py
     └── migrations/
@@ -180,7 +195,8 @@ django-phase1-training/
         ├── 0001_initial.py
         ├── 0002_author_post_author.py
         ├── 0003_authorprofile.py
-        └── 0004_category_post_categories.py
+        ├── 0004_category_post_categories.py
+        └── 0005_phase4_indexes_and_constraints.py
 ```
 
 Local files that also exist and must stay out of version control:
@@ -297,7 +313,7 @@ GET /blog/api/posts/?is_published=true&search=First&page=2
 
 ## Testing
 
-The automated suite is `blog/tests.py`, class `PostApiTests`. It has 22 tests and uses Django REST Framework's `APITestCase`.
+The automated suite is `blog/tests.py`. `PostApiTests` has 22 API tests and uses Django REST Framework's `APITestCase`. `Phase4OrmTests` has 18 ORM tests and uses Django's `TestCase`.
 
 Covered behavior:
 
@@ -314,9 +330,11 @@ Covered behavior:
 - HTTP 400 for an invalid `is_published` value
 - one combined filter, search, and pagination request
 
-Verified result: `python manage.py test blog` reported `Ran 22 tests` and `OK`.
+`Phase4OrmTests` covers the composite index, all four database constraints, `CharLength`, the raw published count, the one-query ORM count, `select_related` and `prefetch_related` query counts, transaction rollback, `publish_post()`, the SQLite `select_for_update` limitation, bulk create, bulk update, and the fact that `create_post()` still sends `post_save`.
 
-The suite does not test the home page, the token-login endpoint, missing-post 404 responses, signals, `create_post()`, the queryset methods, relationships, or the admin site.
+Verified result: `python manage.py test blog` reported `Ran 40 tests` and `OK`.
+
+The suite does not test the home page, the token-login endpoint, missing-post 404 responses, `PublishedManager`, or the admin site. It does not test real row locking, because SQLite does not provide it through Django's `select_for_update()`.
 
 ## Security notes
 

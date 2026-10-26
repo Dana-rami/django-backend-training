@@ -1,8 +1,22 @@
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError, connection, transaction
+from django.db.models.signals import post_save
+from django.test import TestCase
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
-from .models import Post
+from .models import Author, AuthorProfile, Category, Post
+from .services import (
+    bulk_create_posts,
+    bulk_set_published,
+    create_author_with_profile,
+    create_post,
+    publish_post,
+    published_post_count,
+    published_post_count_raw,
+)
 
 
 class PostApiTests(APITestCase):
@@ -304,3 +318,248 @@ class PostApiTests(APITestCase):
         )
         self.assertIsNotNone(response.data["previous"])
         self.assertIsNone(response.data["next"])
+
+
+class Phase4OrmTests(TestCase):
+    def test_post_has_published_id_index(self):
+        indexes = {index.name: list(index.fields) for index in Post._meta.indexes}
+
+        self.assertEqual(
+            indexes["blog_post_published_id_idx"],
+            ["is_published", "id"],
+        )
+
+    def test_blank_title_violates_check_constraint(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Post.objects.create(title="", content="A real body")
+
+    def test_title_equal_to_content_violates_check_constraint(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Post.objects.create(title="Same text", content="Same text")
+
+    def test_duplicate_author_email_violates_unique_constraint(self):
+        Author.objects.create(name="First", email="same@example.com")
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Author.objects.create(name="Second", email="same@example.com")
+
+    def test_duplicate_category_name_violates_unique_constraint(self):
+        Category.objects.create(name="News")
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Category.objects.create(name="News")
+
+    def test_valid_rows_satisfy_constraints(self):
+        post = Post.objects.create(title="Valid title", content="Valid body")
+        author = Author.objects.create(name="Ada", email="ada@example.com")
+        profile = AuthorProfile.objects.create(author=author, bio="Writer")
+        category = Category.objects.create(name="Notes")
+
+        self.assertEqual(post.title, "Valid title")
+        self.assertEqual(profile.bio, "Writer")
+        self.assertEqual(category.name, "Notes")
+
+    def test_with_title_length_matches_python_length(self):
+        post = Post.objects.create(title="Alpha", content="Body text")
+
+        annotated = Post.objects.with_title_length().get(pk=post.pk)
+
+        self.assertEqual(annotated.title_length, len("Alpha"))
+
+    def test_raw_published_count_matches_orm(self):
+        Post.objects.create(title="Published one", content="Body one", is_published=True)
+        Post.objects.create(title="Published two", content="Body two", is_published=True)
+        Post.objects.create(title="Draft title", content="Draft body", is_published=False)
+
+        self.assertEqual(published_post_count_raw(), 2)
+        self.assertEqual(published_post_count(), 2)
+
+    def test_published_post_count_uses_one_query(self):
+        Post.objects.create(title="Published one", content="Body one", is_published=True)
+        Post.objects.create(title="Draft title", content="Draft body", is_published=False)
+
+        with self.assertNumQueries(1):
+            self.assertEqual(published_post_count(), 1)
+
+    def test_with_author_avoids_extra_queries(self):
+        author = Author.objects.create(name="Ada", email="ada@example.com")
+        for number in range(1, 4):
+            Post.objects.create(
+                title=f"Title {number}",
+                content=f"Body {number}",
+                author=author,
+            )
+
+        plain_posts = list(Post.objects.order_by("id"))
+        with self.assertNumQueries(3):
+            self.assertEqual(
+                [post.author.name for post in plain_posts],
+                ["Ada", "Ada", "Ada"],
+            )
+
+        loaded_posts = list(Post.objects.order_by("id").with_author())
+        with self.assertNumQueries(0):
+            self.assertEqual(
+                [post.author.name for post in loaded_posts],
+                ["Ada", "Ada", "Ada"],
+            )
+
+    def test_with_categories_avoids_extra_queries(self):
+        news = Category.objects.create(name="News")
+        notes = Category.objects.create(name="Notes")
+        first = Post.objects.create(title="First title", content="First body")
+        second = Post.objects.create(title="Second title", content="Second body")
+        first.categories.add(news)
+        second.categories.add(notes, news)
+
+        plain_posts = list(Post.objects.order_by("id"))
+        with self.assertNumQueries(2):
+            self.assertEqual(
+                [
+                    sorted(category.name for category in post.categories.all())
+                    for post in plain_posts
+                ],
+                [["News"], ["News", "Notes"]],
+            )
+
+        loaded_posts = list(Post.objects.order_by("id").with_categories())
+        with self.assertNumQueries(0):
+            self.assertEqual(
+                [
+                    sorted(category.name for category in post.categories.all())
+                    for post in loaded_posts
+                ],
+                [["News"], ["News", "Notes"]],
+            )
+
+    def test_create_author_with_profile_saves_both(self):
+        author = create_author_with_profile(
+            name="Grace",
+            email="grace@example.com",
+            bio="Mathematician",
+        )
+
+        self.assertEqual(Author.objects.count(), 1)
+        self.assertEqual(author.profile.bio, "Mathematician")
+
+    def test_create_author_with_profile_rolls_back(self):
+        with patch(
+            "blog.services.AuthorProfile.objects.create",
+            side_effect=RuntimeError("profile failed"),
+        ):
+            with self.assertRaises(RuntimeError):
+                create_author_with_profile(
+                    name="Grace",
+                    email="grace@example.com",
+                    bio="Mathematician",
+                )
+
+        self.assertFalse(Author.objects.filter(email="grace@example.com").exists())
+        self.assertFalse(AuthorProfile.objects.exists())
+
+    def test_publish_post_persists_flag(self):
+        post = Post.objects.create(
+            title="Draft title",
+            content="Draft body",
+            is_published=False,
+        )
+
+        publish_post(post.id)
+        post.refresh_from_db()
+
+        self.assertIs(post.is_published, True)
+
+    def test_select_for_update_does_not_lock_rows_on_sqlite(self):
+        post = Post.objects.create(title="Lock title", content="Lock body")
+
+        with self.assertNumQueries(1) as captured:
+            list(Post.objects.select_for_update().filter(pk=post.pk))
+
+        sql = captured.captured_queries[0]["sql"]
+        self.assertFalse(connection.features.has_select_for_update)
+        self.assertNotIn("FOR UPDATE", sql.upper())
+
+    def test_bulk_create_posts_inserts_rows_without_signals(self):
+        created_titles = []
+
+        def record_create(sender, instance, created, **kwargs):
+            if created:
+                created_titles.append(instance.title)
+
+        post_save.connect(record_create, sender=Post)
+        try:
+            created = bulk_create_posts(
+                [
+                    {
+                        "title": "Bulk one",
+                        "content": "Body one",
+                        "is_published": True,
+                    },
+                    {
+                        "title": "Bulk two",
+                        "content": "Body two",
+                        "is_published": False,
+                    },
+                ]
+            )
+        finally:
+            post_save.disconnect(record_create, sender=Post)
+
+        self.assertEqual(created_titles, [])
+        self.assertEqual(
+            [post.title for post in created],
+            ["Bulk one", "Bulk two"],
+        )
+        self.assertEqual(
+            list(
+                Post.objects.order_by("id").values_list("title", "is_published")
+            ),
+            [("Bulk one", True), ("Bulk two", False)],
+        )
+
+    def test_bulk_set_published_updates_only_selected_rows(self):
+        keep = Post.objects.create(
+            title="Keep title",
+            content="Keep body",
+            is_published=False,
+        )
+        change = Post.objects.create(
+            title="Change title",
+            content="Change body",
+            is_published=False,
+        )
+        saved_ids = []
+
+        def record_save(sender, instance, **kwargs):
+            saved_ids.append(instance.pk)
+
+        post_save.connect(record_save, sender=Post)
+        try:
+            bulk_set_published([change.id], is_published=True)
+        finally:
+            post_save.disconnect(record_save, sender=Post)
+
+        keep.refresh_from_db()
+        change.refresh_from_db()
+        self.assertEqual(saved_ids, [])
+        self.assertIs(keep.is_published, False)
+        self.assertIs(change.is_published, True)
+
+    def test_create_post_still_sends_signal(self):
+        created_titles = []
+
+        def record_create(sender, instance, created, **kwargs):
+            if created:
+                created_titles.append(instance.title)
+
+        post_save.connect(record_create, sender=Post)
+        try:
+            create_post(title="Signal title", content="Signal body")
+        finally:
+            post_save.disconnect(record_create, sender=Post)
+
+        self.assertEqual(created_titles, ["Signal title"])
