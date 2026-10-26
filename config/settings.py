@@ -13,7 +13,20 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
+
+from .environment import (
+    DEFAULT_ANON_THROTTLE_RATE,
+    DEFAULT_USER_THROTTLE_RATE,
+    https_enabled,
+    cache_settings,
+    celery_config,
+    parse_allowed_hosts,
+    parse_cors_allowed_origins,
+    parse_throttle_rate,
+    security_settings,
+)
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -31,7 +44,37 @@ SECRET_KEY = os.environ["SECRET_KEY"]
 # Environment variables are strings. Only the text "True" turns debug on.
 DEBUG = os.environ.get("DEBUG", "False") == "True"
 
-ALLOWED_HOSTS = []
+try:
+    ALLOWED_HOSTS = parse_allowed_hosts(os.environ.get("ALLOWED_HOSTS"))
+except ValueError as exc:
+    raise ImproperlyConfigured(str(exc)) from exc
+
+# Only the text "True" enables HTTPS-only cookies, redirect, and HSTS.
+_USE_HTTPS = https_enabled(os.environ.get("USE_HTTPS"))
+_SECURITY = security_settings(_USE_HTTPS)
+SECURE_SSL_REDIRECT = _SECURITY["SECURE_SSL_REDIRECT"]
+SESSION_COOKIE_SECURE = _SECURITY["SESSION_COOKIE_SECURE"]
+CSRF_COOKIE_SECURE = _SECURITY["CSRF_COOKIE_SECURE"]
+SECURE_HSTS_SECONDS = _SECURITY["SECURE_HSTS_SECONDS"]
+SECURE_HSTS_INCLUDE_SUBDOMAINS = _SECURITY["SECURE_HSTS_INCLUDE_SUBDOMAINS"]
+SECURE_HSTS_PRELOAD = _SECURITY["SECURE_HSTS_PRELOAD"]
+
+try:
+    CORS_ALLOWED_ORIGINS = parse_cors_allowed_origins(
+        os.environ.get("CORS_ALLOWED_ORIGINS")
+    )
+except ValueError as exc:
+    raise ImproperlyConfigured(str(exc)) from exc
+
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOW_CREDENTIALS = False
+
+CACHES = cache_settings(os.environ.get("REDIS_URL"))
+
+_CELERY = celery_config(os.environ.get("CELERY_BROKER_URL"))
+CELERY_BROKER_URL = _CELERY["broker_url"]
+CELERY_TASK_ALWAYS_EAGER = _CELERY["task_always_eager"]
+CELERY_TASK_EAGER_PROPAGATES = _CELERY["task_eager_propagates"]
 
 
 # Application definition
@@ -43,19 +86,43 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'corsheaders',
     'blog',
     'rest_framework',
     'rest_framework.authtoken',
 ]
 
+try:
+    _ANON_THROTTLE_RATE = parse_throttle_rate(
+        os.environ.get("ANON_THROTTLE_RATE"),
+        DEFAULT_ANON_THROTTLE_RATE,
+    )
+    _USER_THROTTLE_RATE = parse_throttle_rate(
+        os.environ.get("USER_THROTTLE_RATE"),
+        DEFAULT_USER_THROTTLE_RATE,
+    )
+except ValueError as exc:
+    raise ImproperlyConfigured(str(exc)) from exc
+
+# Throttling stores counters in the default Django cache. With more than one
+# server worker, set REDIS_URL so those workers share one counter.
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.TokenAuthentication',
     ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': _ANON_THROTTLE_RATE,
+        'user': _USER_THROTTLE_RATE,
+    },
 }
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -82,17 +149,20 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = 'config.asgi.application'
 
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
+_sqlite_path = os.environ.get("SQLITE_PATH", "").strip()
+_database = {
+    'ENGINE': 'django.db.backends.sqlite3',
+    'NAME': _sqlite_path or BASE_DIR / 'db.sqlite3',
 }
+if _sqlite_path:
+    _database['OPTIONS'] = {'timeout': 20}
+DATABASES = {'default': _database}
 
 
 # Password validation

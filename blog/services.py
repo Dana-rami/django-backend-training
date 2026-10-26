@@ -1,6 +1,10 @@
+from django.core.cache import cache
 from django.db import connection, transaction
 
 from .models import Author, AuthorProfile, Post
+
+PUBLISHED_POST_COUNT_KEY = "blog:published-post-count"
+PUBLISHED_POST_COUNT_TIMEOUT = 60
 
 
 def create_post(*, title, content, is_published=False):
@@ -14,6 +18,21 @@ def create_post(*, title, content, is_published=False):
 def published_post_count():
     """Return the number of published posts with one ORM count query."""
     return Post.objects.published().count()
+
+
+def cached_published_post_count():
+    """Return the published post count, shared by every caller.
+
+    A cache miss stores the ORM count for 60 seconds under
+    ``blog:published-post-count``. The value is not user-specific.
+    Post changes can leave it stale until that timeout. This does not
+    cache the post list, and ``published_post_count()`` stays uncached.
+    """
+    return cache.get_or_set(
+        PUBLISHED_POST_COUNT_KEY,
+        published_post_count,
+        timeout=PUBLISHED_POST_COUNT_TIMEOUT,
+    )
 
 
 def published_post_count_raw():

@@ -1,4 +1,4 @@
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import SearchFilter
 from rest_framework.pagination import PageNumberPagination
@@ -12,6 +12,14 @@ from .services import create_post
 
 def home(request):
     return HttpResponse("Welcome to my Blog!")
+
+
+async def status(request):
+    """Return a small JSON status payload.
+
+    This view does not touch the database or the post services.
+    """
+    return JsonResponse({"status": "ok"})
 
 
 class PostPagination(PageNumberPagination):
